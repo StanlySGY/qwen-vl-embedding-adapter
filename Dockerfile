@@ -13,7 +13,7 @@ ENV HF_HOME=/models/huggingface \
     HUGGINGFACE_HUB_CACHE=/models/huggingface/hub \
     MODEL_ID=${MODEL_ID}
 
-RUN python - <<'PY'
+RUN python3 - <<'PY'
 import os
 from huggingface_hub import snapshot_download
 
