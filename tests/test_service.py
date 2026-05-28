@@ -1,41 +1,37 @@
-import base64
-from io import BytesIO
-
 import pytest
 from fastapi.testclient import TestClient
-from PIL import Image
 
 from app.config import get_settings
-from app.image_loader import load_image
 from app.main import app
-from app.qwen_embedding import apply_dimensions, build_prompt, get_embedder
+from app.qwen_embedding import EmbeddingResult, apply_dimensions, build_messages, get_embedder
 from app.schemas import MultiModalInput, normalize_input
 
 
 class MockEmbedder:
-    async def embed(self, items: list[MultiModalInput], dimensions: int | None = None) -> list[list[float]]:
+    def __init__(self):
+        self.calls: list[tuple[list[MultiModalInput], int | None]] = []
+
+    async def embed(self, items: list[MultiModalInput], dimensions: int | None = None) -> EmbeddingResult:
+        self.calls.append((items, dimensions))
         base = [[1.0, 2.0, 3.0] for _ in items]
-        return [apply_dimensions(item, dimensions) for item in base]
+        return EmbeddingResult(
+            embeddings=[apply_dimensions(item, dimensions) for item in base],
+            prompt_tokens=len(items),
+            total_tokens=len(items),
+        )
 
 
-@pytest.fixture(autouse=True)
-def override_embedder():
-    app.dependency_overrides[get_embedder] = lambda: MockEmbedder()
-    yield
+@pytest.fixture
+def mock_embedder():
+    embedder = MockEmbedder()
+    app.dependency_overrides[get_embedder] = lambda: embedder
+    yield embedder
     app.dependency_overrides.clear()
 
 
 @pytest.fixture
-def client() -> TestClient:
+def client(mock_embedder: MockEmbedder) -> TestClient:
     return TestClient(app)
-
-
-def image_data_url() -> str:
-    image = Image.new("RGB", (1, 1), "white")
-    buffer = BytesIO()
-    image.save(buffer, format="PNG")
-    payload = base64.b64encode(buffer.getvalue()).decode("ascii")
-    return f"data:image/png;base64,{payload}"
 
 
 def test_normalize_single_text():
@@ -50,22 +46,25 @@ def test_normalize_batch_text():
     assert [item.text for item in items] == ["春天", "秋天"]
 
 
-def test_build_prompts():
-    text_prompt = build_prompt(text="一只白猫")
-    image_prompt = build_prompt(has_image=True)
-    mixed_prompt = build_prompt(text="一只白猫", has_image=True)
+def test_build_image_messages():
+    messages = build_messages(MultiModalInput(image="https://img.url/cat.jpg"))
+    assert messages == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "https://img.url/cat.jpg"}},
+                {"type": "text", "text": "Represent the user's input."},
+            ],
+        }
+    ]
 
-    assert "Represent the user's input." in text_prompt
-    assert "一只白猫" in text_prompt
-    assert "<|vision_start|><|image_pad|><|vision_end|>" in image_prompt
-    assert "<|vision_start|><|image_pad|><|vision_end|>一只白猫" in mixed_prompt
 
-
-@pytest.mark.asyncio
-async def test_load_data_url_image():
-    image = await load_image(image_data_url(), timeout=1)
-    assert image.size == (1, 1)
-    assert image.mode == "RGB"
+def test_build_mixed_messages():
+    messages = build_messages(MultiModalInput(text="一只白猫", image="data:image/jpeg;base64,xxxx"))
+    assert messages[0]["content"] == [
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,xxxx"}},
+        {"type": "text", "text": "一只白猫"},
+    ]
 
 
 def test_apply_dimensions():
@@ -74,7 +73,7 @@ def test_apply_dimensions():
         apply_dimensions([1.0], 2)
 
 
-def test_embeddings_text_response(client: TestClient):
+def test_embeddings_text_response(client: TestClient, mock_embedder: MockEmbedder):
     response = client.post(
         "/v1/embeddings",
         json={"model": get_settings().model_alias, "input": "一只白色的小猫", "dimensions": 2},
@@ -85,17 +84,19 @@ def test_embeddings_text_response(client: TestClient):
     assert body["object"] == "list"
     assert body["model"] == get_settings().model_alias
     assert body["data"] == [{"object": "embedding", "embedding": [1.0, 2.0], "index": 0}]
-    assert body["usage"] == {"prompt_tokens": 0, "total_tokens": 0}
+    assert body["usage"] == {"prompt_tokens": 1, "total_tokens": 1}
+    assert mock_embedder.calls[0][0][0].text == "一只白色的小猫"
+    assert mock_embedder.calls[0][1] == 2
 
 
-def test_embeddings_mixed_batch_response(client: TestClient):
+def test_embeddings_mixed_batch_response(client: TestClient, mock_embedder: MockEmbedder):
     response = client.post(
         "/v1/embeddings",
         json={
             "model": get_settings().model_alias,
             "input": [
-                {"text": "一只白猫", "image": image_data_url()},
-                {"image": image_data_url()},
+                {"text": "一只白猫", "image": "data:image/jpeg;base64,xxxx"},
+                {"image": "https://img.url/mountain.jpg"},
             ],
         },
     )
@@ -104,6 +105,8 @@ def test_embeddings_mixed_batch_response(client: TestClient):
     body = response.json()
     assert len(body["data"]) == 2
     assert [item["index"] for item in body["data"]] == [0, 1]
+    assert mock_embedder.calls[0][0][0].text == "一只白猫"
+    assert mock_embedder.calls[0][0][1].image == "https://img.url/mountain.jpg"
 
 
 def test_reject_wrong_model(client: TestClient):

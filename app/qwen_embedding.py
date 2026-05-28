@@ -1,32 +1,25 @@
+from dataclasses import dataclass
 from functools import lru_cache
-from typing import Protocol
+from typing import Any, Protocol
 
-from PIL import Image
+import httpx
 
 from app.config import Settings, get_settings
-from app.image_loader import load_image
 from app.schemas import MultiModalInput
 
 DEFAULT_INSTRUCTION = "Represent the user's input."
-IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
+
+
+@dataclass
+class EmbeddingResult:
+    embeddings: list[list[float]]
+    prompt_tokens: int = 0
+    total_tokens: int = 0
 
 
 class Embedder(Protocol):
-    async def embed(self, items: list[MultiModalInput], dimensions: int | None = None) -> list[list[float]]:
+    async def embed(self, items: list[MultiModalInput], dimensions: int | None = None) -> EmbeddingResult:
         ...
-
-
-def build_prompt(text: str | None = None, has_image: bool = False) -> str:
-    user_content = ""
-    if has_image:
-        user_content += IMAGE_PLACEHOLDER
-    if text:
-        user_content += text
-    return (
-        f"<|im_start|>system\n{DEFAULT_INSTRUCTION}<|im_end|>\n"
-        f"<|im_start|>user\n{user_content}<|im_end|>\n"
-        "<|im_start|>assistant\n"
-    )
 
 
 def apply_dimensions(embedding: list[float], dimensions: int | None) -> list[float]:
@@ -37,63 +30,101 @@ def apply_dimensions(embedding: list[float], dimensions: int | None) -> list[flo
     return embedding[:dimensions]
 
 
-class QwenVLEmbedder:
+def build_messages(item: MultiModalInput) -> list[dict[str, Any]]:
+    content: list[dict[str, Any]] = []
+    if item.image:
+        content.append({"type": "image_url", "image_url": {"url": item.image}})
+    if item.text:
+        content.append({"type": "text", "text": item.text})
+    elif item.image:
+        content.append({"type": "text", "text": DEFAULT_INSTRUCTION})
+    return [{"role": "user", "content": content}]
+
+
+class UpstreamEmbeddingError(RuntimeError):
+    pass
+
+
+class UpstreamEmbeddingClient:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self._llm = None
-        self._smart_resize = _load_smart_resize()
 
-    async def embed(self, items: list[MultiModalInput], dimensions: int | None = None) -> list[list[float]]:
-        inputs = []
-        for item in items:
-            has_image = item.image is not None
-            prompt = build_prompt(text=item.text, has_image=has_image)
-            if has_image:
-                image = await load_image(item.image or "", self.settings.image_fetch_timeout)
-                inputs.append({"prompt": prompt, "multi_modal_data": {"image": self._prepare_image(image)}})
-            else:
-                inputs.append(prompt)
+    async def embed(self, items: list[MultiModalInput], dimensions: int | None = None) -> EmbeddingResult:
+        if all(item.image is None for item in items):
+            return await self._embed_text_batch(items, dimensions)
+        return await self._embed_multimodal_items(items, dimensions)
 
-        outputs = self.llm.embed(inputs, use_tqdm=False)
-        embeddings = [list(output.outputs.embedding) for output in outputs]
-        return [apply_dimensions(embedding, dimensions) for embedding in embeddings]
+    async def _embed_text_batch(self, items: list[MultiModalInput], dimensions: int | None) -> EmbeddingResult:
+        input_value: str | list[str]
+        texts = [item.text or "" for item in items]
+        input_value = texts[0] if len(texts) == 1 else texts
+        return await self._post_embeddings({"input": input_value}, dimensions)
 
-    @property
-    def llm(self):
-        if self._llm is None:
-            self._llm = self._create_llm()
-        return self._llm
+    async def _embed_multimodal_items(self, items: list[MultiModalInput], dimensions: int | None) -> EmbeddingResult:
+        embeddings: list[list[float]] = []
+        prompt_tokens = 0
+        total_tokens = 0
+        async with httpx.AsyncClient(timeout=self.settings.upstream_timeout) as client:
+            for item in items:
+                body = self._base_body(dimensions)
+                if item.image:
+                    body["messages"] = build_messages(item)
+                else:
+                    body["input"] = item.text or ""
+                payload = await self._post(client, body)
+                embeddings.extend(_extract_embeddings(payload, dimensions=None))
+                usage = payload.get("usage") or {}
+                prompt_tokens += int(usage.get("prompt_tokens") or 0)
+                total_tokens += int(usage.get("total_tokens") or 0)
+        return EmbeddingResult(embeddings=embeddings, prompt_tokens=prompt_tokens, total_tokens=total_tokens)
 
-    def _create_llm(self):
-        from vllm import LLM
+    async def _post_embeddings(self, body_part: dict[str, Any], dimensions: int | None) -> EmbeddingResult:
+        body = self._base_body(dimensions)
+        body.update(body_part)
+        async with httpx.AsyncClient(timeout=self.settings.upstream_timeout) as client:
+            payload = await self._post(client, body)
+        usage = payload.get("usage") or {}
+        return EmbeddingResult(
+            embeddings=_extract_embeddings(payload, dimensions=None),
+            prompt_tokens=int(usage.get("prompt_tokens") or 0),
+            total_tokens=int(usage.get("total_tokens") or 0),
+        )
 
-        kwargs = {
-            "model": self.settings.model_id,
-            "runner": "pooling",
-            "max_model_len": self.settings.max_model_len,
-            "limit_mm_per_prompt": {"image": 1},
-            "seed": self.settings.seed,
-        }
-        if self._smart_resize is not None:
-            kwargs["mm_processor_kwargs"] = {"do_resize": False}
-        return LLM(**kwargs)
+    def _base_body(self, dimensions: int | None) -> dict[str, Any]:
+        body: dict[str, Any] = {"model": self.settings.upstream_model, "encoding_format": "float"}
+        if dimensions is not None:
+            body["dimensions"] = dimensions
+        return body
 
-    def _prepare_image(self, image: Image.Image) -> Image.Image:
-        if self._smart_resize is None:
-            return image
-        width, height = image.size
-        resized_height, resized_width = self._smart_resize(height, width, factor=32)
-        return image.resize((resized_width, resized_height))
+    async def _post(self, client: httpx.AsyncClient, body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            response = await client.post(str(self.settings.upstream_embeddings_url), json=body)
+        except httpx.HTTPError as exc:
+            raise UpstreamEmbeddingError(f"failed to call upstream embedding service: {exc}") from exc
+        if response.status_code >= 400:
+            raise UpstreamEmbeddingError(f"upstream embedding service returned {response.status_code}: {response.text}")
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise UpstreamEmbeddingError("upstream embedding service returned non-JSON response") from exc
+        if not isinstance(payload, dict):
+            raise UpstreamEmbeddingError("upstream embedding service returned invalid response")
+        return payload
 
 
-def _load_smart_resize():
-    try:
-        from qwen_vl_utils import smart_resize
-    except ModuleNotFoundError:
-        return None
-    return smart_resize
+def _extract_embeddings(payload: dict[str, Any], dimensions: int | None) -> list[list[float]]:
+    data = payload.get("data")
+    if not isinstance(data, list):
+        raise UpstreamEmbeddingError("upstream response missing data list")
+    embeddings = []
+    for item in sorted(data, key=lambda value: int(value.get("index", 0))):
+        embedding = item.get("embedding")
+        if not isinstance(embedding, list):
+            raise UpstreamEmbeddingError("upstream response item missing embedding")
+        embeddings.append(apply_dimensions([float(value) for value in embedding], dimensions))
+    return embeddings
 
 
 @lru_cache
-def get_embedder() -> QwenVLEmbedder:
-    return QwenVLEmbedder(get_settings())
+def get_embedder() -> UpstreamEmbeddingClient:
+    return UpstreamEmbeddingClient(get_settings())

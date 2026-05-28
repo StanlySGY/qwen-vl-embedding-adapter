@@ -3,9 +3,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.config import Settings, get_settings
-from app.image_loader import ImageLoadError
-from app.qwen_embedding import Embedder, get_embedder
-from app.schemas import EmbeddingData, EmbeddingsRequest, EmbeddingsResponse, normalize_input, openai_error
+from app.qwen_embedding import Embedder, UpstreamEmbeddingError, get_embedder
+from app.schemas import EmbeddingData, EmbeddingsRequest, EmbeddingsResponse, Usage, normalize_input, openai_error
 
 app = FastAPI(title="Qwen3-VL Embedding Adapter", version="1.0.0")
 
@@ -37,14 +36,20 @@ async def create_embeddings(
 
     try:
         items = normalize_input(request.input)
-        embeddings = await embedder.embed(items, request.dimensions)
-    except (ValueError, ImageLoadError) as exc:
+        result = await embedder.embed(items, request.dimensions)
+    except ValueError as exc:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
             content=openai_error(str(exc), param="input"),
         )
+    except UpstreamEmbeddingError as exc:
+        return JSONResponse(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            content=openai_error(str(exc), error_type="upstream_error"),
+        )
 
     return EmbeddingsResponse(
-        data=[EmbeddingData(embedding=embedding, index=index) for index, embedding in enumerate(embeddings)],
+        data=[EmbeddingData(embedding=embedding, index=index) for index, embedding in enumerate(result.embeddings)],
         model=settings.model_alias,
+        usage=Usage(prompt_tokens=result.prompt_tokens, total_tokens=result.total_tokens),
     )
