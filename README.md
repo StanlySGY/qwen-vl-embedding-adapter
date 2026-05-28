@@ -43,6 +43,23 @@ docker run -p 8080:8080 \
   qwen-vl-embedding-adapter:v1.0.0
 ```
 
+## Run with Docker Compose
+
+Create `.env` on the target server:
+
+```bash
+UPSTREAM_BASE_URL=http://your-existing-qwen-service:8000
+UPSTREAM_MODEL=qwen3-vl-embedding
+```
+
+Start:
+
+```bash
+docker compose up -d
+```
+
+If your upstream Qwen service is running directly on the Docker host, keep the default `UPSTREAM_BASE_URL=http://host.docker.internal:8000` or set the correct host port.
+
 ## API
 
 ```bash

@@ -1,0 +1,14 @@
+services:
+  qwen-vl-embedding-adapter:
+    image: qwen-vl-embedding-adapter:v1.0.0
+    container_name: qwen-vl-embedding-adapter
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      MODEL_ALIAS: ${MODEL_ALIAS:-qwen3-vl-embedding}
+      UPSTREAM_BASE_URL: ${UPSTREAM_BASE_URL:-http://host.docker.internal:8000}
+      UPSTREAM_MODEL: ${UPSTREAM_MODEL:-qwen3-vl-embedding}
+      UPSTREAM_TIMEOUT: ${UPSTREAM_TIMEOUT:-120}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
